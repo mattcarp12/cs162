@@ -26,6 +26,7 @@ int64_t next_alarm_clock_signal;
 
 /* List of alarm_clocks */
 struct list alarm_clock_list;
+struct lock alarm_clock_list_lock;
 
 /* Number of loops per timer tick.
    Initialized by timer_calibrate(). */
@@ -46,6 +47,7 @@ void timer_init(void)
   pit_configure_channel(0, 2, TIMER_FREQ);
   intr_register_ext(0x20, timer_interrupt, "8254 Timer");
   list_init(&alarm_clock_list);
+  lock_init(&alarm_clock_list_lock);
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -94,24 +96,34 @@ timer_elapsed(int64_t then)
 
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
    be turned on. */
-void timer_sleep(int64_t ticks)
+void timer_sleep(int64_t ticks_)
 {
+  if (ticks_ <= 0)
+    return;
+
   int64_t start = timer_ticks();
 
   ASSERT(intr_get_level() == INTR_ON);
-  intr_disable();
 
+  lock_acquire(&alarm_clock_list_lock);
+
+  /* Create new alarm clock struct */
   struct alarm_clock ac;
-  ac.signal_time = start + ticks;
-  ac.t = thread_current();
+  ac.signal_time = start + ticks_;
+  sema_init(&ac.sema, 0);
 
-  struct alarm_clock *head = list_entry(list_front(&alarm_clock_list), struct alarm_clock, elem);
-
-  if (list_empty(&alarm_clock_list) || ac.signal_time < head->signal_time)
+  /* Check if next_alarm_clock_signal needs to be updated */
+  if (list_empty(&alarm_clock_list) || ac.signal_time < next_alarm_clock_signal)
+  {
     next_alarm_clock_signal = ac.signal_time;
+  }
 
-  list_insert_ordered(&alarm_clock_list, &ac, alarm_clock_less, NULL);
-  thread_block();
+  /* Add alarm to list and put thread to sleep */
+  list_insert_ordered(&alarm_clock_list, &ac.elem, alarm_clock_less, NULL);
+
+  lock_release(&alarm_clock_list_lock);
+
+  sema_down(&ac.sema);
 }
 
 static bool alarm_clock_less(const struct list_elem *a_, const struct list_elem *b_,
@@ -194,10 +206,10 @@ timer_interrupt(struct intr_frame *args UNUSED)
   ticks++;
 
   /* Handle alarm clocks */
-  if (!list_empty(&alarm_clock_list) && ticks == next_alarm_clock_signal)
+  while (!list_empty(&alarm_clock_list) && ticks == next_alarm_clock_signal)
   {
     struct alarm_clock *alarm = list_entry(list_pop_front(&alarm_clock_list), struct alarm_clock, elem);
-    thread_unblock(alarm->t);
+    sema_up(&alarm->sema);
     if (!list_empty(&alarm_clock_list))
     {
       struct alarm_clock *next_alarm = list_entry(list_front(&alarm_clock_list), struct alarm_clock, elem);
